@@ -1,0 +1,24 @@
+# config/cloud_config.yaml
+aws:
+  region: us-east-1
+  ecs:
+    cluster: trading-bot-cluster
+    service: trading-bot-service
+    task_definition: trading-bot-task
+    desired_count: 1
+    container_memory: 2048
+    container_cpu: 1024
+  
+monitoring:
+  cloudwatch:
+    log_group: /ecs/trading-bot
+    metrics_namespace: TradingBot
+    alerts:
+      memory_threshold: 80
+      cpu_threshold: 80
+  
+scaling:
+  auto_scaling: true
+  min_instances: 1
+  max_instances: 1
+  target_cpu_utilization: 75
