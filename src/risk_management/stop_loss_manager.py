@@ -1,6 +1,6 @@
 # src/risk_management/stop_loss_manager.py
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 import logging
 

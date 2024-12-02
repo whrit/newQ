@@ -27,6 +27,15 @@ class PortfolioMetrics:
     sharpe_ratio: float  # Added
     volatility: float    # Added
 
+@dataclass
+class PortfolioConstraints:
+    max_position_size: float
+    max_sector_exposure: float
+    max_leverage: float
+    max_concentration: float
+    max_correlation: float
+    min_cash_buffer: float
+
 class PortfolioManager:
     """
     Advanced portfolio management with risk controls and optimization
@@ -37,7 +46,21 @@ class PortfolioManager:
         self.logger = logging.getLogger(__name__)
         self.positions = {}
         self.sector_mappings = {}
-        self.constraints = PortfolioConstraints(**config['constraints'])
+        
+        # Set default constraints if not provided in config
+        default_constraints = {
+            'max_position_size': 0.2,
+            'max_sector_exposure': 0.3,
+            'max_leverage': 1.5,
+            'max_concentration': 0.25,
+            'max_correlation': 0.7,
+            'min_cash_buffer': 0.05
+        }
+        
+        # Use provided constraints or defaults
+        constraints_config = config.get('constraints', default_constraints)
+        self.constraints = PortfolioConstraints(**constraints_config)
+        
         self.historical_data = {}
         
         # Initialize Alpaca clients
@@ -128,11 +151,26 @@ class PortfolioManager:
                 ticker = yf.Ticker(symbol)
                 data = ticker.history(period="1d")
                 if not data.empty:
-                    prices[symbol] = data['Close'].iloc[-1]
+                    # Use standardized column name
+                    prices[symbol] = data['Close'].iloc[-1]  # Keep 'Close' capitalized for direct access
             except Exception as e:
                 self.logger.error(f"Error getting yfinance price for {symbol}: {str(e)}")
         return prices
 
+    def _get_market_data(self, symbol: str) -> pd.DataFrame:
+        """Get market data for symbol and standardize column names"""
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period="1mo")
+            
+            # Standardize column names to lowercase
+            data.columns = data.columns.str.lower()
+            
+            return data
+        except Exception as e:
+            self.logger.error(f"Error getting market data for {symbol}: {str(e)}")
+            return pd.DataFrame()
+        
     async def _get_historical_returns(self, symbols: List[str]) -> pd.DataFrame:
         """Get historical returns using Alpaca with yfinance fallback"""
         try:
@@ -159,11 +197,18 @@ class PortfolioManager:
                     # Fallback to yfinance
                     ticker = yf.Ticker(symbol)
                     df = ticker.history(period="1y")
+                    # Standardize column names
+                    df = df.reset_index()
+                    df.columns = df.columns.str.lower()
+                    df = df.rename(columns={'index': 'date', 'close': 'close'})
                     df['symbol'] = symbol
-                    dfs.append(df[['Close']].reset_index())
+                    dfs.append(df[['date', 'close', 'symbol']])
             
+            if not dfs:
+                return pd.DataFrame()
+                
             # Combine and calculate returns
-            combined_df = pd.concat(dfs)
+            combined_df = pd.concat(dfs, ignore_index=True)
             pivot_df = combined_df.pivot(
                 index='date',
                 columns='symbol',
@@ -171,7 +216,7 @@ class PortfolioManager:
             )
             
             return pivot_df.pct_change().dropna()
-            
+                
         except Exception as e:
             self.logger.error(f"Error getting historical returns: {str(e)}")
             return pd.DataFrame()
@@ -231,6 +276,161 @@ class PortfolioManager:
         except Exception as e:
             self.logger.error(f"Error getting NAV: {str(e)}")
             return sum(self.positions.values())
+        
+    async def _calculate_portfolio_metrics(self, positions: Dict[str, float],
+                                        prices: Dict[str, float],
+                                        account_value: float) -> PortfolioMetrics:
+        """Calculate comprehensive portfolio metrics"""
+        try:
+            # Calculate exposures
+            position_values = {symbol: size * prices.get(symbol, 0) 
+                            for symbol, size in positions.items()}
+            
+            long_exposure = sum(v for v in position_values.values() if v > 0)
+            short_exposure = sum(v for v in position_values.values() if v < 0)
+            net_exposure = long_exposure + short_exposure
+            gross_exposure = long_exposure - short_exposure
+            
+            # Calculate leverage
+            leverage = gross_exposure / account_value if account_value > 0 else 0
+            
+            # Calculate sector exposures
+            sector_exposure = {}
+            for symbol, value in position_values.items():
+                sector = await self._get_sector_mappings(symbol)
+                sector_exposure[sector] = sector_exposure.get(sector, 0) + value
+                
+            # Normalize sector exposure by total value
+            sector_exposure = {k: v/account_value for k, v in sector_exposure.items()}
+            
+            # Calculate concentration
+            position_concentration = self._calculate_concentration(position_values, account_value)
+            
+            # Calculate beta and correlation - Fix the await statements
+            betas = await self._get_asset_betas()
+            beta = sum(betas.values()) / len(positions) if positions else 0
+            
+            returns = await self._get_historical_returns(list(positions.keys()))
+            correlation_matrix = returns.corr() if not returns.empty else pd.DataFrame()
+            
+            # Calculate performance metrics
+            volatility = returns.std().mean() * np.sqrt(252) if not returns.empty else 0
+            
+            # Calculate Sharpe ratio
+            if not returns.empty:
+                excess_returns = returns.mean() - 0.02/252  # Assuming 2% risk-free rate
+                sharpe_ratio = np.sqrt(252) * excess_returns.mean() / volatility if volatility > 0 else 0
+            else:
+                sharpe_ratio = 0
+            
+            return PortfolioMetrics(
+                total_value=account_value,
+                cash=account_value - net_exposure,
+                long_exposure=long_exposure,
+                short_exposure=short_exposure,
+                net_exposure=net_exposure,
+                gross_exposure=gross_exposure,
+                leverage=leverage,
+                sector_exposure=sector_exposure,
+                position_concentration=position_concentration,
+                beta=beta,
+                correlation_matrix=correlation_matrix,
+                sharpe_ratio=sharpe_ratio,
+                volatility=volatility
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating portfolio metrics: {str(e)}")
+            raise
+
+    def _check_constraints(self, metrics: PortfolioMetrics) -> List[str]:
+        """Check portfolio constraints and return list of violations"""
+        violations = []
+        
+        try:
+            # Check leverage
+            if metrics.leverage > self.constraints.max_leverage:
+                violations.append(
+                    f"Leverage {metrics.leverage:.2f} exceeds max {self.constraints.max_leverage}"
+                )
+                
+            # Check position concentration
+            if metrics.position_concentration > self.constraints.max_concentration:
+                violations.append(
+                    f"Concentration {metrics.position_concentration:.2f} exceeds max {self.constraints.max_concentration}"
+                )
+                
+            # Check sector exposure
+            for sector, exposure in metrics.sector_exposure.items():
+                if abs(exposure) > self.constraints.max_sector_exposure:
+                    violations.append(
+                        f"Sector {sector} exposure {exposure:.2f} exceeds max {self.constraints.max_sector_exposure}"
+                    )
+                    
+            # Check cash buffer
+            cash_ratio = metrics.cash / metrics.total_value
+            if cash_ratio < self.constraints.min_cash_buffer:
+                violations.append(
+                    f"Cash buffer {cash_ratio:.2f} below minimum {self.constraints.min_cash_buffer}"
+                )
+                
+            # Check correlation constraints
+            if len(metrics.correlation_matrix) > 1:  # Only check if we have multiple positions
+                correlations = metrics.correlation_matrix.values
+                np.fill_diagonal(correlations, 0)  # Ignore self-correlations
+                max_correlation = np.max(np.abs(correlations))
+                
+                if max_correlation > self.constraints.max_correlation:
+                    violations.append(
+                        f"Maximum correlation {max_correlation:.2f} exceeds limit {self.constraints.max_correlation}"
+                    )
+                    
+            return violations
+            
+        except Exception as e:
+            self.logger.error(f"Error checking constraints: {str(e)}")
+            return [f"Error checking constraints: {str(e)}"]
+
+    def _calculate_concentration(self, position_values: Dict[str, float], 
+                            total_value: float) -> float:
+        """Calculate portfolio concentration (Herfindahl index)"""
+        try:
+            if not position_values or total_value == 0:
+                return 0
+                
+            # Calculate position weights
+            weights = [abs(v)/total_value for v in position_values.values()]
+            
+            # Calculate Herfindahl index
+            return sum(w*w for w in weights)
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating concentration: {str(e)}")
+            return 0
+
+    async def _update_historical_data(self, metrics: PortfolioMetrics):
+        """Update historical data for portfolio analysis"""
+        try:
+            timestamp = datetime.now()
+            
+            self.historical_data[timestamp] = {
+                'total_value': metrics.total_value,
+                'cash': metrics.cash,
+                'leverage': metrics.leverage,
+                'position_concentration': metrics.position_concentration,
+                'sharpe_ratio': metrics.sharpe_ratio,
+                'volatility': metrics.volatility
+            }
+            
+            # Keep only last 30 days of data
+            cutoff = timestamp - timedelta(days=30)
+            self.historical_data = {
+                k: v for k, v in self.historical_data.items()
+                if k > cutoff
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error updating historical data: {str(e)}")
 
     async def optimize_portfolio(self) -> Dict[str, float]:
         """

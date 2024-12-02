@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict
 
-from src.utils.config import ConfigManager
+from config.trading_config import ConfigManager
 from src.models.sentiment_analyzer import SentimentAnalyzer
 from src.agents.deep_q_agent import DeepQAgent
 from src.features.technical_indicators import TechnicalAnalyzer
@@ -84,8 +84,8 @@ class SystemValidator:
         # Test Alpaca
         try:
             portfolio_manager = PortfolioManager(self.config_manager.get_api_config())
-            account = await portfolio_manager.update_portfolio()
-            logger.info("Alpaca API test successful")
+            metrics = await portfolio_manager.update_portfolio()
+            logger.info(f"Alpaca API test successful: Portfolio Value {metrics.total_value}")
         except Exception as e:
             logger.error(f"Alpaca API test failed: {str(e)}")
             raise

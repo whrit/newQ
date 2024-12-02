@@ -1,6 +1,6 @@
 # src/environment.py
 import numpy as np
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, List
 from dataclasses import dataclass
 import pandas as pd
 from datetime import datetime, timedelta

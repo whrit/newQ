@@ -254,6 +254,7 @@ class SentimentAnalyzer:
             # Get historical data using yfinance
             ticker = yf.Ticker(symbol)
             historical_data = ticker.history(period="1y")
+            historical_data.columns = historical_data.columns.str.lower()
             
             # Calculate technical features
             features = self.technical_analyzer.calculate_features(historical_data)

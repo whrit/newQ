@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 import ast
 from typing import Any, Dict
+import torch
 
 class ConfigManager:
     """Manage configuration settings from environment variables"""

@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List
 
-from src.utils.config import ConfigManager
+from config.trading_config import ConfigManager
 from src.models.sentiment_analyzer import SentimentAnalyzer
 from src.agents.deep_q_agent import DeepQAgent
 from src.features.technical_indicators import TechnicalAnalyzer
