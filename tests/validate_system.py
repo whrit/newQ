@@ -8,7 +8,7 @@ from typing import Dict
 
 from config.trading_config import ConfigManager
 from src.models.sentiment_analyzer import SentimentAnalyzer
-from src.agents.deep_q_agent import DeepQAgent
+from src.agents.deep_q_agent import DeepQAgent, DeepQAgentConfig
 from src.features.technical_indicators import TechnicalAnalyzer
 from src.features.market_sentiment import MarketSentimentAnalyzer
 from src.risk_management.portfolio_manager import PortfolioManager
@@ -99,6 +99,24 @@ class SystemValidator:
                 # Test technical analysis
                 tech_analyzer = TechnicalAnalyzer()
                 data = self._get_test_data(symbol)
+                
+                if data.empty:
+                    logger.warning(f"No data available for {symbol}, skipping validation")
+                    continue
+                
+                # Ensure numeric columns are float64
+                numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                for col in numeric_columns:
+                    if col in data.columns:
+                        data[col] = data[col].astype(np.float64)
+                
+                # Standardize column names to lowercase
+                data.columns = data.columns.str.lower()
+                
+                if not set(['open', 'high', 'low', 'close', 'volume']).issubset(data.columns):
+                    logger.warning(f"Missing required columns for {symbol}, skipping validation")
+                    continue
+                    
                 features = tech_analyzer.calculate_features(data)
                 logger.info(f"Technical analysis for {symbol} successful")
                 
@@ -112,29 +130,52 @@ class SystemValidator:
             except Exception as e:
                 logger.error(f"Data pipeline validation failed for {symbol}: {str(e)}")
                 raise
-                
+
+    def _validate_market_data(self, data: pd.DataFrame) -> bool:
+        """Check if market data is valid for analysis"""
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        
+        if data.empty:
+            return False
+            
+        if not all(col in data.columns for col in required_columns):
+            return False
+            
+        if len(data) < 2:  # Need at least 2 data points for analysis
+            return False
+            
+        return True             
+       
     async def test_trading_components(self):
         """Test trading components"""
         logger.info("Testing trading components...")
         
         try:
-            # Initialize agent
-            state_dim = 10  # Example state dimension
-            action_dim = 3  # Example action dimension (buy, hold, sell)
-            agent = DeepQAgent(state_dim=state_dim, action_dim=action_dim)
+            # Initialize agent with proper configuration
+            config = {
+                'state_dim': 10,
+                'action_dim': 3,
+                'hidden_dims': [64, 64, 32],  # Three hidden layers
+                'learning_rate': 0.001,
+                'gamma': 0.99,
+                'batch_size': 32,
+                'buffer_size': 10000
+            }
+            
+            agent = DeepQAgent(DeepQAgentConfig(**config))
             
             # Test action selection
-            test_state = np.random.random(state_dim)
+            test_state = np.random.random(config['state_dim']).astype(np.float32)  # Ensure float32 type
             action = agent.select_action(test_state)
             logger.info(f"Agent action selection test passed: {action}")
             
             # Test training step
-            for _ in range(5):  # Add some test experiences
+            for _ in range(5):
                 agent.update_memory(
                     test_state,
                     action,
                     reward=0.1,
-                    next_state=np.random.random(state_dim),
+                    next_state=np.random.random(config['state_dim']).astype(np.float32),
                     done=False
                 )
             
@@ -180,9 +221,22 @@ class SystemValidator:
     def _get_test_data(self, symbol: str) -> pd.DataFrame:
         """Get test data for a symbol"""
         import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period="1mo")
-        return data
+        
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period="1mo")
+            
+            # Convert numeric columns to float64
+            numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            for col in numeric_columns:
+                if col in data.columns:
+                    data[col] = pd.to_numeric(data[col], errors='coerce').astype(np.float64)
+                    
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error fetching test data for {symbol}: {e}")
+            return pd.DataFrame()
 
 def main():
     """Run system validation"""

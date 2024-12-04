@@ -36,7 +36,7 @@ class ConfigManager:
             'buffer_size': int(self.get('MEMORY_SIZE', 10000)),
             'update_frequency': int(self.get('TARGET_UPDATE', 100)),
             'hidden_dims': self.get('HIDDEN_DIMS', [256, 128]),
-            'device': "cuda" if torch.cuda.is_available() else "cpu"
+            'device': "cuda" if torch.cuda.is_available() else "mps" if torch.torch.backends.mps.is_available else "cpu"
         }
         
     def get_api_config(self) -> Dict:

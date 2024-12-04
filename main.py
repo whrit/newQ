@@ -11,10 +11,12 @@ import traceback
 
 from config.trading_config import ConfigManager
 from src.models.sentiment_analyzer import SentimentAnalyzer
-from src.agents.deep_q_agent import DeepQAgent
+from src.agents.deep_q_agent import DeepQAgent, DeepQAgentConfig
 from src.features.technical_indicators import TechnicalAnalyzer
 from src.features.market_sentiment import MarketSentimentAnalyzer
 from src.risk_management.portfolio_manager import PortfolioManager
+from src.data.data_manager import DataManager
+from src.models.agent_manager import AgentManager
 
 class TradingSystem:
     def __init__(self):
@@ -26,9 +28,14 @@ class TradingSystem:
         self.config_manager = ConfigManager()
         self.config = self.config_manager.get_api_config()
         
-        # Initialize components
-        self.initialize_components()
+        self.logger.info("Initializing Trading System...")
         
+        # Initialize components
+        self.agent_manager = AgentManager(save_dir="models/saved_agents")
+        
+        # Modified initialize_components method
+        self.initialize_components()
+
         # Trading state
         self.is_running = False
         self.last_update = None
@@ -56,32 +63,119 @@ class TradingSystem:
         )
         
     def initialize_components(self):
-        """Initialize all trading system components"""
+        """Initialize all trading system components."""
         try:
+            # Initialize DataManager first since other components need it
+            self.data_manager = DataManager(self.config)
+            
             # Initialize analyzers
-            self.sentiment_analyzer = SentimentAnalyzer()
-            self.market_sentiment = MarketSentimentAnalyzer(self.config)
-            self.tech_analyzer = TechnicalAnalyzer()
+            self.sentiment_analyzer = SentimentAnalyzer(
+                custom_config=self.config,
+                data_manager=self.data_manager
+            )
+            self.market_sentiment = MarketSentimentAnalyzer(
+                config=self.config,
+                data_manager=self.data_manager
+            )
+            self.tech_analyzer = TechnicalAnalyzer(data_manager=self.data_manager)
             
             # Initialize portfolio manager
-            self.portfolio_manager = PortfolioManager(self.config)
+            self.portfolio_manager = PortfolioManager(self.config, data_manager=self.data_manager)
             
-            # Initialize trading agent
+            # Initialize trading agent with persistence
             state_dim = self._calculate_state_dim()
-            self.agent = DeepQAgent(
+            agent_config = DeepQAgentConfig(
                 state_dim=state_dim,
-                action_dim=3  # buy, hold, sell
+                action_dim=3,  # Buy, Hold, Sell
+                hidden_dims=[512, 256, 128],
+                learning_rate=0.001,
+                gamma=0.99,
+                initial_epsilon=0.5,  # Lower initial epsilon for pretrained agent
+                final_epsilon=0.01,
+                epsilon_decay=0.995
             )
+            
+            # Get or create agent
+            self.agent = self.agent_manager.get_agent(agent_config)
+            
+            # Pre-train if new agent
+            if self.agent.steps == 0:
+                self.logger.info("New agent detected. Starting pre-training...")
+                self._pre_train_agent()
+            else:
+                self.logger.info(f"Loaded existing agent with {self.agent.steps} training steps")
             
             # Load trading universe
             self.symbols = self.config_manager.get('TRADING_SYMBOLS', 
-                                                 ['AAPL', 'MSFT', 'GOOGL'])
+                                                ['AAPL', 'MSFT', 'GOOGL'])
             
             self.logger.info("All components initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing components: {str(e)}")
             raise
+            
+    def _pre_train_agent(self):
+        """Pre-train agent on historical data"""
+        try:
+            # Get historical data for pre-training
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=730)  # One year of data
+            
+            total_samples = 0
+            for symbol in self.symbols:
+                self.logger.info(f"Pre-training on {symbol}")
+                
+                # Get historical data
+                data = self.data_manager.get_market_data(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                if data.empty:
+                    self.logger.warning(f"No historical data available for {symbol}")
+                    continue
+                
+                # Create training examples
+                for i in range(len(data) - 1):
+                    # Get state and next state
+                    state = self._prepare_agent_state({
+                        'technical': self.tech_analyzer.calculate_features(data.iloc[:i+1]),
+                        'sentiment': 0,  # Historical sentiment not available
+                        'portfolio': self.portfolio_manager.get_portfolio_metrics()
+                    })
+                    
+                    next_state = self._prepare_agent_state({
+                        'technical': self.tech_analyzer.calculate_features(data.iloc[:i+2]),
+                        'sentiment': 0,
+                        'portfolio': self.portfolio_manager.get_portfolio_metrics()
+                    })
+                    
+                    # Calculate reward (simple price change for now)
+                    price_change = (data.iloc[i+1]['close'] - data.iloc[i]['close']) / data.iloc[i]['close']
+                    reward = price_change * 100  # Scale reward for better learning
+                    
+                    # Determine optimal action (simplified)
+                    action = 0 if price_change > 0.01 else (2 if price_change < -0.01 else 1)
+                    
+                    # Add to replay buffer
+                    self.agent.update_memory(state, action, reward, next_state, False)
+                    total_samples += 1
+                    
+                    # Train periodically
+                    if total_samples % 100 == 0:
+                        metrics = self.agent.train_step()
+                        if metrics:
+                            self.logger.info(f"Pre-training metrics: {metrics}")
+                            
+            self.logger.info(f"Pre-training completed with {total_samples} samples")
+            
+            # Save pre-trained agent
+            self.agent_manager.save_agent(self.agent)
+            
+        except Exception as e:
+            self.logger.error(f"Error during pre-training: {e}")
             
     async def run(self):
         """Main trading loop"""
@@ -96,6 +190,9 @@ class TradingSystem:
             self.logger.error(f"Error in main trading loop: {str(e)}")
             self.logger.error(traceback.format_exc())
             await self.shutdown()
+        finally:
+            # Save agent state before exiting
+            self.agent_manager.save_agent(self.agent)
             
     async def trading_loop(self):
         """Single iteration of the trading loop"""
@@ -133,33 +230,37 @@ class TradingSystem:
             self.logger.error(traceback.format_exc())
             
     async def update_market_state(self) -> Dict:
-        """Update and return current market state"""
+        """Update and return current market state."""
         self.logger.info("Updating market state...")
         state = {}
-        
+
         try:
+            start_date = datetime.now() - timedelta(days=30)  # Fetch last 30 days
+            end_date = datetime.now()
+
             for symbol in self.symbols:
                 # Get sentiment analysis
                 sentiment = await self.market_sentiment.analyze_sentiment(symbol)
-                
+
                 # Get technical features
+                market_data = self._get_market_data(symbol, start_date, end_date)
                 technical = self.tech_analyzer.calculate_features(
-                    self._get_market_data(symbol)
+                    data=market_data, start_date=start_date, end_date=end_date
                 )
-                
+
                 # Get portfolio state
                 portfolio = await self.portfolio_manager.update_portfolio()
-                
+
                 state[symbol] = {
                     'sentiment': sentiment,
                     'technical': technical,
                     'portfolio': portfolio,
                     'timestamp': datetime.now()
                 }
-                
+
             self.last_update = datetime.now()
             return state
-            
+
         except Exception as e:
             self.logger.error(f"Error updating market state: {str(e)}")
             return {}
@@ -243,23 +344,29 @@ class TradingSystem:
             self.logger.error(f"Error training agent: {str(e)}")
             
     async def update_metrics(self):
-        """Update and log performance metrics"""
+        """Update and log performance metrics."""
         try:
             portfolio = await self.portfolio_manager.update_portfolio()
-            
+
             self.performance_metrics['portfolio_values'].append(portfolio.total_value)
-            
+
+            # Add returns or placeholder value
             if len(self.performance_metrics['portfolio_values']) > 1:
-                returns = (portfolio.total_value / 
-                          self.performance_metrics['portfolio_values'][-2] - 1)
-                self.performance_metrics['returns'].append(returns)
-                
+                returns = (
+                    portfolio.total_value /
+                    self.performance_metrics['portfolio_values'][-2] - 1
+                )
+            else:
+                returns = 0.0  # No prior value for returns
+
+            self.performance_metrics['returns'].append(returns)
+
             # Log current metrics
             self.log_metrics()
-            
+
         except Exception as e:
             self.logger.error(f"Error updating metrics: {str(e)}")
-            
+
     def log_metrics(self):
         """Log current performance metrics"""
         try:
@@ -300,21 +407,24 @@ class TradingSystem:
             self.logger.error(f"Error saving system state: {str(e)}")
             
     def save_metrics(self):
-        """Save performance metrics to file"""
+        """Save performance metrics to file."""
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+
+            # Align metrics before saving
+            max_len = max(len(self.performance_metrics['portfolio_values']), len(self.performance_metrics['returns']))
+            self.performance_metrics['portfolio_values'].extend([None] * (max_len - len(self.performance_metrics['portfolio_values'])))
+            self.performance_metrics['returns'].extend([None] * (max_len - len(self.performance_metrics['returns'])))
+
             # Save trades
-            pd.DataFrame(self.performance_metrics['trades']).to_csv(
-                f"trades_{timestamp}.csv"
-            )
-            
+            pd.DataFrame(self.performance_metrics['trades']).to_csv(f"trades_{timestamp}.csv", index=False)
+
             # Save performance metrics
             pd.DataFrame({
                 'portfolio_value': self.performance_metrics['portfolio_values'],
                 'returns': self.performance_metrics['returns']
-            }).to_csv(f"performance_{timestamp}.csv")
-            
+            }).to_csv(f"performance_{timestamp}.csv", index=False)
+
         except Exception as e:
             self.logger.error(f"Error saving metrics: {str(e)}")
             
@@ -349,7 +459,7 @@ class TradingSystem:
         features.extend([
             tech.trend_indicators['sma_short'] / tech.trend_indicators['sma_long'],
             (tech.momentum_indicators['rsi'] - 50) / 50,
-            tech.momentum_indicators['macd'] / 100,
+            tech.trend_indicators['macd'] / 100,
             tech.volatility_indicators['historical_volatility'],
             tech.volume_indicators['volume_ma_ratio'] - 1
         ])
@@ -364,11 +474,16 @@ class TradingSystem:
         
         return np.array(features)
         
-    def _get_market_data(self, symbol: str) -> pd.DataFrame:
-        """Get market data for symbol"""
-        import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        return ticker.history(period="1mo")
+    def _get_market_data(self, symbol: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """Fetch market data using DataManager"""
+        try:
+            data = self.data_manager.get_market_data(symbol, start_date=start_date, end_date=end_date)
+            if data.empty:
+                self.logger.warning(f"No market data available for {symbol}.")
+            return data
+        except Exception as e:
+            self.logger.error(f"Error fetching market data for {symbol}: {str(e)}")
+            return pd.DataFrame()
         
     def handle_shutdown(self, signum, frame):
         """Handle shutdown signal"""
@@ -385,8 +500,8 @@ class TradingSystem:
             if self.config_manager.get('CLOSE_POSITIONS_ON_SHUTDOWN', True):
                 await self.portfolio_manager.close_all_positions()
                 
-            # Save final state
-            self.agent.save(f"agent_final_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth")
+            # Save final state with agent manager
+            self.agent_manager.save_agent(self.agent)
             self.save_metrics()
             
             self.logger.info("Trading system shutdown complete")

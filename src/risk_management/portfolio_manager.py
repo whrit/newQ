@@ -10,6 +10,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from src.data.data_manager import DataManager
 
 @dataclass
 class PortfolioMetrics:
@@ -41,9 +44,10 @@ class PortfolioManager:
     Advanced portfolio management with risk controls and optimization
     Using Alpaca and yfinance for market data
     """
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, data_manager: DataManager):
         self.config = config
         self.logger = logging.getLogger(__name__)
+        self.data_manager = data_manager
         self.positions = {}
         self.sector_mappings = {}
         
@@ -53,7 +57,7 @@ class PortfolioManager:
             'max_sector_exposure': 0.3,
             'max_leverage': 1.5,
             'max_concentration': 0.25,
-            'max_correlation': 0.7,
+            'max_correlation': 0.8,
             'min_cash_buffer': 0.05
         }
         
@@ -158,18 +162,21 @@ class PortfolioManager:
         return prices
 
     def _get_market_data(self, symbol: str) -> pd.DataFrame:
-        """Get market data for symbol and standardize column names"""
         try:
-            ticker = yf.Ticker(symbol)
-            data = ticker.history(period="1mo")
+            # Fetch market data from DataManager
+            start_date = datetime.now() - timedelta(days=365)
+            end_date = datetime.now()
+            data = self.data_manager.get_market_data(symbol, start_date=start_date, end_date=end_date)
             
-            # Standardize column names to lowercase
-            data.columns = data.columns.str.lower()
+            if data.empty:
+                self.logger.warning(f"No market data available for {symbol}.")
+                return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
             
             return data
         except Exception as e:
             self.logger.error(f"Error getting market data for {symbol}: {str(e)}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
         
     async def _get_historical_returns(self, symbols: List[str]) -> pd.DataFrame:
         """Get historical returns using Alpaca with yfinance fallback"""
@@ -248,22 +255,10 @@ class PortfolioManager:
             return {symbol: 1.0 for symbol in self.positions.keys()}
 
     async def _get_sector_mappings(self, symbol: str) -> str:
-        """Get sector information from yfinance"""
         try:
-            if symbol in self._sector_cache:
-                if datetime.now() - self._sector_cache_expiry[symbol] < self.SECTOR_CACHE_DURATION:
-                    return self._sector_cache[symbol]
-            
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            sector = info.get('sector', 'Unknown')
-            
-            # Update cache
-            self._sector_cache[symbol] = sector
-            self._sector_cache_expiry[symbol] = datetime.now()
-            
-            return sector
-            
+            # Use DataManager to fetch fundamental data
+            fundamental_data = self.data_manager.get_fundamental_data(symbol)
+            return fundamental_data.get('sector', 'Unknown')
         except Exception as e:
             self.logger.error(f"Error getting sector for {symbol}: {str(e)}")
             return 'Unknown'
@@ -391,6 +386,70 @@ class PortfolioManager:
             self.logger.error(f"Error checking constraints: {str(e)}")
             return [f"Error checking constraints: {str(e)}"]
 
+    async def open_position(self, symbol: str, size: float) -> bool:
+        """Open a new position or add to existing position"""
+        try:
+            # Check if we already have a position
+            current_positions = await self._get_alpaca_positions()
+            current_size = current_positions.get(symbol, 0)
+            
+            # Calculate the difference needed
+            size_diff = size - current_size
+            
+            if abs(size_diff) < 0.01:  # Negligible difference
+                return True
+                
+            # Submit order
+            if size_diff > 0:
+                order_request = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=abs(size_diff),
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                )
+                self.trading_client.submit_order(order_request)
+            else:
+                order_request = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=abs(size_diff),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                self.trading_client.submit_order(order_request)
+                
+            self.logger.info(f"Opened/Modified position in {symbol}: {size_diff}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error opening position in {symbol}: {str(e)}")
+            return False
+            
+    async def close_position(self, symbol: str) -> bool:
+        """Close an existing position"""
+        try:
+            # Check if we have a position
+            current_positions = await self._get_alpaca_positions()
+            if symbol not in current_positions:
+                return True  # Already closed
+                
+            # Get current position size
+            size = current_positions[symbol]
+            
+            # Submit order to close position
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=abs(size),
+                side=OrderSide.SELL if size > 0 else OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            self.trading_client.submit_order(order_request)
+            self.logger.info(f"Closed position in {symbol}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position in {symbol}: {str(e)}")
+            return False
+            
     def _calculate_concentration(self, position_values: Dict[str, float], 
                             total_value: float) -> float:
         """Calculate portfolio concentration (Herfindahl index)"""

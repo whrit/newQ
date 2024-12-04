@@ -181,7 +181,7 @@ class MultiTimeframeModelTrainer:
             factor=0.5, 
             patience=5
         )
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.torch.backends.mps.is_available else "cpu")
         self.model.to(self.device)
         
     def train_step(self, batch: Dict[str, torch.Tensor], targets: torch.Tensor) -> Dict[str, float]:

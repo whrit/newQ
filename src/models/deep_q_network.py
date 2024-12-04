@@ -12,7 +12,7 @@ class NetworkConfig:
     action_dim: int
     hidden_dims: List[int]
     learning_rate: float
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.torch.backends.mps.is_available else "cpu"
 
 class DuelingDQN(nn.Module):
     """

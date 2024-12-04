@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
+from src.features.technical_indicators import TechnicalAnalyzer
+import yfinance as yf
+from src.data.data_manager import DataManager
 
 @dataclass
 class SentimentScore:
@@ -101,23 +104,42 @@ class AlphaVantageNewsClient:
 
 class MarketSentimentAnalyzer:
     """
-    Market sentiment analysis using news, technical, and fundamental data
+    Market sentiment analysis using news, technical, and fundamental data.
     """
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, data_manager: DataManager):
         self.config = config
+        self.data_manager = data_manager
         self.logger = logging.getLogger(__name__)
         self.cache = {}
         self.cache_duration = timedelta(minutes=15)
         
         # Initialize Alpha Vantage client
-        self.alpha_vantage = AlphaVantageNewsClient(config["alpha_vantage_api_key"])
+        self.alpha_vantage = AlphaVantageNewsClient(config.get("alpha_vantage_api_key"))
         
+        if not data_manager:
+            raise ValueError("A valid DataManager instance is required.")
+        
+        # Initialize TechnicalAnalyzer with DataManager
+        self.technical_analyzer = TechnicalAnalyzer(data_manager=data_manager)
+
+    def _check_cache(self, symbol: str) -> bool:
+        """Check if we have valid cached data for the symbol"""
+        if symbol not in self.cache:
+            return False
+
+        timestamp, _ = self.cache[symbol]
+        return datetime.now() - timestamp < self.cache_duration
+
+    def _update_cache(self, symbol: str, data: Dict) -> None:
+        """Update cache with new sentiment data"""
+        self.cache[symbol] = (datetime.now(), data)
+
     async def analyze_sentiment(self, symbol: str) -> MarketSentiment:
         """
         Analyze market sentiment from multiple sources
         """
         if self._check_cache(symbol):
-            return self.cache[symbol]['data']
+            return self.cache[symbol][1]
             
         try:
             # Gather sentiment from different sources concurrently
@@ -223,59 +245,166 @@ class MarketSentimentAnalyzer:
         return np.exp(-hours_old / 24)  # 24-hour half-life
         
     def _analyze_technical_sentiment(self, symbol: str) -> Dict[str, float]:
-        """Analyze sentiment from technical indicators"""
+        """Analyze sentiment from technical indicators."""
         try:
-            # Get technical indicators
-            technical_indicators = self._get_technical_indicators(symbol)
+            # Define the date range
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=90)  # Last 3 months
+
+            # Get market data with more history
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(start=start_date, end=end_date, interval="1d")
             
-            # Calculate sentiment scores
-            sentiment = {
-                'trend_strength': self._calculate_trend_strength(technical_indicators),
-                'momentum': self._calculate_momentum_sentiment(technical_indicators),
-                'volatility': self._calculate_volatility_sentiment(technical_indicators),
-                'support_resistance': self._calculate_support_resistance_sentiment(technical_indicators)
-            }
+            if data.empty:
+                self.logger.warning(f"No market data available for {symbol}")
+                return {}
             
-            return sentiment
-            
+            # Convert column names to lowercase and ensure float type
+            data = data.astype(float)
+            data.columns = data.columns.str.lower()
+
+            # Calculate technical features using TechnicalAnalyzer
+            features = self.technical_analyzer.calculate_features(data, start_date=start_date, end_date=end_date)
+
+            # Get trading signals
+            signals = self.technical_analyzer.get_trading_signals(features)
+
+            # Ensure all values are float
+            return {k: float(v) for k, v in signals.items()}
+
         except Exception as e:
             self.logger.error(f"Error in technical sentiment: {str(e)}")
             return {}
+
+    def _get_fundamental_data(self, symbol: str) -> Dict:
+        """Get fundamental data using yfinance"""
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            return {
+                'pe_ratio': info.get('forwardPE', 0),
+                'peg_ratio': info.get('pegRatio', 0),
+                'profit_margins': info.get('profitMargins', 0),
+                'revenue_growth': info.get('revenueGrowth', 0),
+                'debt_to_equity': info.get('debtToEquity', 0),
+                'current_ratio': info.get('currentRatio', 0),
+                'return_on_equity': info.get('returnOnEquity', 0),
+                'beta': info.get('beta', 1)
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting fundamental data: {str(e)}")
+            return {}
+
+    def _calculate_earnings_sentiment(self, fundamentals: Dict) -> float:
+        """Calculate sentiment based on earnings metrics"""
+        try:
+            profit_margin_score = np.clip(fundamentals.get('profit_margins', 0) * 5, -1, 1)
+            roe_score = np.clip(fundamentals.get('return_on_equity', 0) * 2, -1, 1)
             
+            weights = [0.6, 0.4]  # Giving more weight to profit margins
+            scores = [profit_margin_score, roe_score]
+            
+            return np.average(scores, weights=weights)
+        except Exception:
+            return 0.0
+
+    def _calculate_valuation_sentiment(self, fundamentals: Dict) -> float:
+        """Calculate sentiment based on valuation metrics"""
+        try:
+            pe_ratio = fundamentals.get('pe_ratio', 0)
+            peg_ratio = fundamentals.get('peg_ratio', 0)
+            
+            # Convert PE and PEG ratios to sentiment scores (-1 to 1)
+            pe_score = 1 - (np.clip(pe_ratio, 0, 50) / 25)  # PE of 25 gives score of 0
+            peg_score = 1 - (np.clip(peg_ratio, 0, 3) / 1.5)  # PEG of 1.5 gives score of 0
+            
+            weights = [0.5, 0.5]
+            scores = [pe_score, peg_score]
+            
+            return np.average(scores, weights=weights)
+        except Exception:
+            return 0.0
+
+    def _calculate_growth_sentiment(self, fundamentals: Dict) -> float:
+        """Calculate sentiment based on growth metrics"""
+        try:
+            revenue_growth = fundamentals.get('revenue_growth', 0)
+            growth_score = np.clip(revenue_growth * 2, -1, 1)  # 50% growth = max score
+            
+            beta = fundamentals.get('beta', 1)
+            beta_score = 1 - abs(beta - 1)  # Score is higher when beta is closer to 1
+            
+            weights = [0.7, 0.3]  # More weight on growth than beta
+            scores = [growth_score, beta_score]
+            
+            return np.average(scores, weights=weights)
+        except Exception:
+            return 0.0
+
     def _analyze_fundamental_sentiment(self, symbol: str) -> Dict[str, float]:
         """Analyze sentiment from fundamental data"""
         try:
             fundamentals = self._get_fundamental_data(symbol)
             
+            if not fundamentals:
+                return {
+                    'earnings_sentiment': 0.0,
+                    'valuation_sentiment': 0.0,
+                    'growth_sentiment': 0.0
+                }
+            
             sentiment = {
                 'earnings_sentiment': self._calculate_earnings_sentiment(fundamentals),
                 'valuation_sentiment': self._calculate_valuation_sentiment(fundamentals),
-                'growth_sentiment': self._calculate_growth_sentiment(fundamentals),
-                'institutional_sentiment': self._calculate_institutional_sentiment(fundamentals)
+                'growth_sentiment': self._calculate_growth_sentiment(fundamentals)
             }
             
             return sentiment
             
         except Exception as e:
             self.logger.error(f"Error in fundamental sentiment: {str(e)}")
-            return {}
+            return {
+                'earnings_sentiment': 0.0,
+                'valuation_sentiment': 0.0,
+                'growth_sentiment': 0.0
+            }
             
     def _calculate_composite_score(self, news_sentiment: Dict[str, SentimentScore],
                                  technical_sentiment: Dict[str, float],
                                  fundamental_sentiment: Dict[str, float]) -> float:
         """Calculate weighted composite sentiment score"""
-        # Adjusted weights to distribute social sentiment weight
-        weights = {
-            'news': 0.4,  # Increased from 0.3
-            'technical': 0.3,  # Increased from 0.25
-            'fundamental': 0.3  # Increased from 0.25
-        }
-        
-        scores = {
-            'news': np.mean([s.value * s.confidence for s in news_sentiment.values()]),
-            'technical': np.mean(list(technical_sentiment.values())),
-            'fundamental': np.mean(list(fundamental_sentiment.values()))
-        }
-        
-        composite_score = sum(scores[k] * weights[k] for k in weights.keys())
-        return np.clip(composite_score, -1, 1)
+        try:
+            # Adjusted weights to distribute social sentiment weight
+            weights = {
+                'news': 0.4,
+                'technical': 0.3,
+                'fundamental': 0.3
+            }
+            
+            # Handle empty dictionaries or missing values
+            news_scores = [s.value * s.confidence for s in news_sentiment.values()]
+            news_score = np.mean(news_scores) if news_scores else 0.0
+            
+            tech_scores = list(technical_sentiment.values())
+            tech_score = np.mean(tech_scores) if tech_scores else 0.0
+            
+            fund_scores = list(fundamental_sentiment.values())
+            fund_score = np.mean(fund_scores) if fund_scores else 0.0
+            
+            scores = {
+                'news': news_score,
+                'technical': tech_score,
+                'fundamental': fund_score
+            }
+            
+            composite_score = sum(scores[k] * weights[k] for k in weights.keys())
+            return float(np.clip(composite_score, -1, 1))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating composite score: {str(e)}")
+            return 0.0
+
+    # Add an alias method for compatibility
+    async def get_sentiment(self, symbol: str) -> MarketSentiment:
+        """Alias for analyze_sentiment for backward compatibility"""
+        return await self.analyze_sentiment(symbol)

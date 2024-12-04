@@ -48,9 +48,15 @@ class TestTradingSession:
         
         # Initialize agent
         state_dim = self._calculate_state_dim()
+        custom_config = {
+            'hidden_dims': [128, 128, 128],
+            'learning_rate': 0.001  # Add other config parameters as needed
+        }
+        
         self.agent = DeepQAgent(
-            state_dim=state_dim,
-            action_dim=3  # buy, hold, sell
+            config_or_state_dim=state_dim,
+            action_dim=3,  # buy, hold, sell
+            custom_config=custom_config
         )
         
     async def run_session(self):

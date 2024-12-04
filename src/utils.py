@@ -1,6 +1,6 @@
 # src/utils.py
 import numpy as np
-from typing import Dict, List, Union, Optional
+from typing import Dict, List, Union, Optional, Tuple
 import pandas as pd
 from datetime import datetime, timedelta
 import logging

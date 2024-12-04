@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from src.features.technical_indicators import TechnicalAnalyzer
 import yfinance as yf
 from config.trading_config import ConfigManager
+from src.data.data_manager import DataManager
 
 @dataclass
 class NewsArticle:
@@ -89,38 +90,45 @@ class AlphaVantageClient:
             return 0.0
 
 class SentimentAnalyzer:
-    def __init__(self, custom_config: Dict = None):
+    def __init__(self, custom_config: Dict = None, data_manager: DataManager = None):
         # Load configuration
         config_manager = ConfigManager()
         base_config = config_manager.get_api_config()
         
         # Merge with custom config if provided
         self.config = {**base_config, **(custom_config or {})}
-        
         self.logger = logging.getLogger(__name__)
         
-        # Initialize Alpha Vantage client with API key from env
+        # Initialize Alpha Vantage client
         self.alpha_vantage = AlphaVantageClient(
             self.config["alpha_vantage_api_key"]
         )
         
-        # Rest of initialization remains the same
-        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        if not data_manager:
+            raise ValueError("A valid DataManager instance is required.")
         
-        self.sentiment_cache = {}
-        self.cache_expiry = timedelta(minutes=30)
-
+        # Initialize TechnicalAnalyzer with DataManager
         self.technical_analyzer = TechnicalAnalyzer(
-        lookback_periods={
-            'short': 14,
-            'medium': 50,
-            'long': 200
-        }
-    )
-        
+            data_manager=data_manager,
+            lookback_periods={
+                'short': 14,
+                'medium': 50,
+                'long': 200
+            }
+        )
+
+    def _check_cache(self, symbol: str, timestamp: datetime) -> bool:
+        """Check if we have valid cached data for the symbol"""
+        if symbol not in self.sentiment_cache:
+            return False
+
+        cached_timestamp, _ = self.sentiment_cache[symbol]
+        return (timestamp - cached_timestamp) < self.cache_expiry
+
+    def _update_cache(self, symbol: str, data: Dict) -> None:
+        """Update cache with new sentiment data"""
+        self.sentiment_cache[symbol] = (datetime.now(), data)        
+
     async def _analyze_news_sentiment(self, symbol: str) -> Dict[str, float]:
         """Analyze sentiment from news sources using Alpha Vantage"""
         try:
@@ -202,12 +210,13 @@ class SentimentAnalyzer:
 
     async def analyze_market_sentiment(self, symbol: str) -> Dict[str, float]:
         """Analyze market sentiment using news and technical data"""
-        cache_key = f"{symbol}_sentiment"
-        if cache_key in self.sentiment_cache:
-            timestamp, sentiment = self.sentiment_cache[cache_key]
-            if datetime.now() - timestamp < self.cache_expiry:
-                return sentiment
-                
+        current_time = datetime.now()
+        
+        if symbol in self.sentiment_cache:
+            if self._check_cache(symbol, current_time):
+                _, cached_data = self.sentiment_cache[symbol]
+                return cached_data
+        
         try:
             # Get news sentiment
             news_sentiment = await self._analyze_news_sentiment(symbol)
@@ -227,16 +236,17 @@ class SentimentAnalyzer:
             }
             
             combined_sentiment = sum(sentiments[source] * weights[source] 
-                                   for source in weights.keys())
+                                for source in weights.keys())
             
             result = {
                 'combined': combined_sentiment,
                 'news_sentiment': news_sentiment,
                 'technical_sentiment': technical_sentiment,
-                'timestamp': datetime.now()
+                'timestamp': current_time
             }
             
-            self.sentiment_cache[cache_key] = (datetime.now(), result)
+            # Update cache
+            self._update_cache(symbol, result)
             return result
             
         except Exception as e:
@@ -245,60 +255,66 @@ class SentimentAnalyzer:
                 'combined': 0.0,
                 'news_sentiment': {'news': 0.0},
                 'technical_sentiment': {'technical': 0.0},
-                'timestamp': datetime.now()
+                'timestamp': current_time
             }
 
-    async def _analyze_technical_sentiment(self, symbol: str) -> Dict[str, float]:
-        """Analyze sentiment from technical indicators using TechnicalAnalyzer"""
+    def _analyze_technical_sentiment(self, symbol: str) -> Dict[str, float]:
+        """Analyze sentiment from technical indicators"""
         try:
-            # Get historical data using yfinance
+            # Get market data with more history
             ticker = yf.Ticker(symbol)
-            historical_data = ticker.history(period="1y")
-            historical_data.columns = historical_data.columns.str.lower()
+            data = ticker.history(period="6mo", interval="1d")  # Changed to 6 months daily data
             
-            # Calculate technical features
-            features = self.technical_analyzer.calculate_features(historical_data)
+            if data.empty:
+                self.logger.warning(f"No market data available for {symbol}")
+                return {}
+                
+            # Log data info for debugging
+            self.logger.info(f"Fetched {len(data)} data points for {symbol}")
+            self.logger.info(f"Data columns: {data.columns.tolist()}")
+            
+            # Convert column names to lowercase and ensure float type
+            data = data.astype(float)
+            data.columns = data.columns.str.lower()
+            
+            # Validate required columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            missing_cols = [col for col in required_cols if col not in data.columns]
+            if missing_cols:
+                self.logger.error(f"Missing required columns for {symbol}: {missing_cols}")
+                return {}
+            
+            # Ensure we have enough data points
+            min_required = 50  # Minimum points needed for reliable analysis
+            if len(data) < min_required:
+                self.logger.warning(f"Insufficient data points for {symbol}: got {len(data)}, need {min_required}")
+                return {}
+            
+            # Remove any infinite or NaN values
+            data = data.replace([np.inf, -np.inf], np.nan)
+            data = data.dropna()
+            
+            if data.empty:
+                self.logger.warning(f"No valid data points remaining after cleaning for {symbol}")
+                return {}
+            
+            # Calculate technical features using TechnicalAnalyzer
+            features = self.technical_analyzer.calculate_features(data)
             
             # Get trading signals
             signals = self.technical_analyzer.get_trading_signals(features)
             
-            # Calculate sentiment scores
-            trend_sentiment = signals.get('trend', 0)
-            momentum_sentiment = signals.get('momentum', 0)
-            volatility_sentiment = -1 * signals.get('volatility', 0)  # Inverse volatility
-            volume_sentiment = signals.get('volume', 0)
+            # Ensure all values are float
+            cleaned_signals = {}
+            for k, v in signals.items():
+                try:
+                    cleaned_signals[k] = float(v)
+                except (TypeError, ValueError) as e:
+                    self.logger.warning(f"Could not convert signal {k} to float: {e}")
+                    cleaned_signals[k] = 0.0
             
-            # Weight the components
-            weights = {
-                'trend': 0.35,
-                'momentum': 0.25,
-                'volatility': 0.20,
-                'volume': 0.20
-            }
-            
-            sentiment_components = {
-                'trend': trend_sentiment,
-                'momentum': momentum_sentiment,
-                'volatility': volatility_sentiment,
-                'volume': volume_sentiment
-            }
-            
-            # Calculate final technical sentiment
-            technical_sentiment = sum(
-                sentiment * weights[component]
-                for component, sentiment in sentiment_components.items()
-            )
-            
-            # Normalize to [-1, 1] range
-            technical_sentiment = np.clip(technical_sentiment, -1, 1)
-            
-            return {
-                'technical': technical_sentiment,
-                'components': sentiment_components,
-                'signals': signals,
-                'timestamp': datetime.now()
-            }
+            return cleaned_signals
             
         except Exception as e:
-            self.logger.error(f"Error in technical sentiment analysis: {str(e)}")
-            return {'technical': 0.0}
+            self.logger.error(f"Error in technical sentiment analysis for {symbol}: {str(e)}")
+            return {}
