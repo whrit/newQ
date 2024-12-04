@@ -193,14 +193,14 @@ class TradingEnvironment:
         self.max_drawdown = 0.0
         self.best_return = -float('inf')
 
-    async def step(self, action: int) -> Tuple[State, float, bool, Dict]:
-        """Execute one environment step"""
+    def step(self, action: int) -> Tuple[State, float, bool, Dict]:
+        """Execute one environment step - synchronous version"""
         try:
             # Execute action
-            execution_info = await self._execute_action(action)
+            execution_info = self._execute_action(action)
             
             # Get new state
-            new_state = await self.get_state(self.config['symbol'])
+            new_state = self.get_state(self.config['symbol'])
             
             # Calculate reward
             reward = self._calculate_reward(execution_info, new_state)
@@ -364,7 +364,7 @@ class TradingEnvironment:
             self.logger.error(f"Error calculating exploration bonus: {str(e)}")
             return 0.0
 
-    async def reset(self) -> State:
+    def reset(self) -> State:
         """Reset environment"""
         self.current_step = 0
         self.current_position = 0
@@ -377,31 +377,34 @@ class TradingEnvironment:
         self.max_drawdown = 0.0
         
         # Add await here
-        initial_state = await self.get_state(self.config['symbol'])
+        initial_state = self.get_state(self.config['symbol'])
         self.state_normalizer.update_stats(initial_state)
         
         return initial_state
 
-    async def _fetch_sector_data(self, symbol: str) -> pd.DataFrame:
-        """Fetch sector-related data"""
+    def _fetch_sector_data(self, symbol: str) -> pd.DataFrame:
+        """Fetch sector-related data synchronously"""
         try:
-            # Get sector for the symbol
             ticker = yf.Ticker(symbol)
             sector = ticker.info.get('sector', '')
-            
-            # Get list of stocks in same sector
             sector_stocks = self._get_sector_stocks(sector)
             
             # Fetch data for all sector stocks
             sector_data = pd.DataFrame()
-            for stock in sector_stocks[:10]:  # Limit to top 10 stocks
-                data = await self.data_manager.get_market_data(
-                    symbol=stock,
-                    start_date=datetime.now() - timedelta(days=90),  # Last 90 days
-                    end_date=datetime.now()
-                )
-                if not data.empty:
-                    sector_data[stock] = data['close']
+            start_date = datetime.now() - timedelta(days=90)
+            
+            for stock in sector_stocks[:10]:
+                try:
+                    ticker = yf.Ticker(stock)
+                    data = ticker.history(start=start_date)
+                    if not data.empty:
+                        # Ensure consistent column naming
+                        if 'Close' in data.columns:
+                            data = data.rename(columns={'Close': 'close'})
+                        sector_data[stock] = data['close']
+                except Exception as e:
+                    self.logger.warning(f"Error fetching data for {stock}: {str(e)}")
+                    continue
                     
             return sector_data
             
@@ -426,20 +429,17 @@ class TradingEnvironment:
         }
         return sector_etfs.get(sector, ['SPY'])  # Default to SPY if sector not found
 
-    async def _fetch_market_indices(self) -> Dict[str, float]:
-        """Fetch major market indices data"""
+    def _fetch_market_indices(self) -> Dict[str, float]:
+        """Fetch major market indices data synchronously"""
         try:
             indices = ['SPY', 'QQQ', 'DIA']
             index_data = {}
             
             for index in indices:
-                data = await self.data_manager.get_market_data(
-                    symbol=index,
-                    start_date=datetime.now() - timedelta(days=5),
-                    end_date=datetime.now()
-                )
+                ticker = yf.Ticker(index)
+                data = ticker.history(period="1d")
                 if not data.empty:
-                    index_data[index] = float(data['close'].iloc[-1])
+                    index_data[index] = float(data['Close'].iloc[-1])
                     
             return index_data
             
@@ -448,14 +448,14 @@ class TradingEnvironment:
             return {'SPY': 0.0, 'QQQ': 0.0, 'DIA': 0.0}
 
     async def _fetch_vix(self) -> float:
-        """Fetch VIX data"""
+        """Fetch VIX data using yfinance"""
         try:
-            vix_data = await self.data_manager.get_market_data(
-                symbol='^VIX',
-                start_date=datetime.now() - timedelta(days=1),
-                end_date=datetime.now()
-            )
-            return float(vix_data['close'].iloc[-1]) if not vix_data.empty else 20.0
+            ticker = yf.Ticker("^VIX")
+            data = ticker.history(period="1d")
+            
+            if not data.empty:
+                return float(data['Close'].iloc[-1])
+            return 20.0  # Default VIX value
             
         except Exception as e:
             self.logger.error(f"Error fetching VIX: {str(e)}")
@@ -483,17 +483,36 @@ class TradingEnvironment:
                 'new_lows': 0
             }
                 
-    async def _fetch_price_data(self, symbol: str) -> Dict[str, np.ndarray]:
-        """Fetch historical price data"""
-        bars_request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Minute,
-            start=(datetime.now() - timedelta(days=5)),
-            end=datetime.now()
-        )
-        
-        bars = self.data_client.get_stock_bars(bars_request)
-        return self._process_bars(bars)
+    def _fetch_price_data(self, symbol: str) -> pd.DataFrame:
+        """Fetch historical price data synchronously"""
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=60)  # Increased from 5 days to ensure sufficient data
+            
+            # Try to get data from data manager first
+            data = self.data_manager.get_market_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if not data.empty:
+                return data
+                
+            # Fallback to yfinance if needed
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(start=start_date, end=end_date, interval="1d")
+            
+            if not data.empty:
+                # Standardize column names
+                data.columns = data.columns.str.lower()
+                return data
+                
+            return pd.DataFrame()
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching price data: {str(e)}")
+            return pd.DataFrame()
         
     async def _fetch_order_book(self, symbol: str) -> Dict[str, List]:
         """Fetch current order book"""
@@ -534,24 +553,21 @@ class TradingEnvironment:
             'day_trade_count': float(account.daytrade_count)
         }
         
-    async def _get_sector_metrics(self, symbol: str) -> Dict[str, float]:
-        """Get sector analysis metrics"""
+    def _get_sector_metrics(self, symbol: str) -> Dict[str, float]:
+        """Get sector analysis metrics synchronously"""
         try:
             # Fetch sector data
-            sector_data = await self._fetch_sector_data(symbol)
+            sector_data = self._fetch_sector_data(symbol)
             
-            # Use data_manager directly to fetch market data
+            # Get market data
             market_symbols = ['SPY', 'QQQ', 'DIA']
             market_data = pd.DataFrame()
             
             for market_symbol in market_symbols:
-                data = await self.data_manager.get_market_data(
-                    symbol=market_symbol,
-                    start_date=datetime.now() - timedelta(days=90),
-                    end_date=datetime.now()
-                )
+                ticker = yf.Ticker(market_symbol)
+                data = ticker.history(period='3mo')
                 if not data.empty:
-                    market_data[market_symbol] = data['close']
+                    market_data[market_symbol] = data['Close']
             
             metrics = self.sector_analyzer.analyze_sector(
                 symbol,
@@ -559,28 +575,43 @@ class TradingEnvironment:
                 market_data
             )
             
-            return metrics.to_dict()
+            return metrics.to_dict() if metrics else {}
             
         except Exception as e:
             self.logger.error(f"Error getting sector metrics: {str(e)}")
             return {}
         
-    async def _get_market_context(self) -> Dict[str, float]:
-        """Get broader market context"""
-        # Market indices
-        indices = await self._fetch_market_indices()
-        
-        # Volatility indicators
-        vix = await self._fetch_vix()
-        
-        # Market breadth
-        breadth = await self._fetch_market_breadth()
-        
-        return {
-            'indices': indices,
-            'volatility': vix,
-            'breadth': breadth
-        }
+    def _get_market_context(self) -> Dict[str, float]:
+        """Get broader market context synchronously"""
+        try:
+            # Market indices
+            indices = self._fetch_market_indices()
+            
+            # Volatility indicators
+            vix_ticker = yf.Ticker("^VIX")
+            vix_data = vix_ticker.history(period="1d")
+            vix = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else 20.0
+            
+            # Market breadth
+            breadth = {
+                'adv_dec_ratio': 1.0,
+                'new_highs': 0,
+                'new_lows': 0
+            }
+            
+            return {
+                'indices': indices,
+                'volatility': vix,
+                'breadth': breadth
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting market context: {str(e)}")
+            return {
+                'indices': {'SPY': 0.0, 'QQQ': 0.0, 'DIA': 0.0},
+                'volatility': 20.0,
+                'breadth': {'adv_dec_ratio': 1.0, 'new_highs': 0, 'new_lows': 0}
+            }
         
     def _calculate_signal_alignment(self, position: float, 
                                   state: State) -> float:
@@ -610,20 +641,25 @@ class TradingEnvironment:
         
         return time_done or capital_done or risk_done
         
-    async def get_state(self, symbol: str) -> State:
-        """Get current environment state"""
+    def get_state(self, symbol: str) -> State:
+        """Get current environment state - synchronous version"""
         try:
-            # Fetch all state components
-            price_data = await self._fetch_price_data(symbol)
+            # Fetch price data
+            price_data = self._fetch_price_data(symbol)
             
-            # Change this line to use the correct method
+            # Ensure price_data is a DataFrame
+            if isinstance(price_data, dict):
+                price_df = pd.DataFrame.from_dict(price_data)
+            else:
+                price_df = price_data
+            
+            # Calculate technical features
             technical_features = self.technical_analyzer.calculate_features(
-                data=pd.DataFrame(price_data),  # Convert price_data to DataFrame
-                start_date=datetime.now() - timedelta(days=30),  # Adjust timeframe as needed
+                data=price_df,
+                start_date=datetime.now() - timedelta(days=30),
                 end_date=datetime.now()
             )
             
-            # Convert TechnicalFeatures to dict for state
             technical_data = {
                 **technical_features.trend_indicators,
                 **technical_features.momentum_indicators,
@@ -632,17 +668,18 @@ class TradingEnvironment:
                 **technical_features.cycle_indicators
             }
             
-            sentiment_data = await self.sentiment_analyzer.get_sentiment(symbol)
-            order_book = await self._fetch_order_book(symbol)
-            order_book_features = self.order_book_analyzer.analyze(order_book)
-            sector_metrics = await self._get_sector_metrics(symbol)
+            # Get other components synchronously
+            sentiment_data = self.sentiment_analyzer.get_sentiment(symbol)
+            order_book_features = self.order_book_analyzer.analyze(price_df)
+            sector_metrics = self._get_sector_metrics(symbol)
             position_info = self._get_position_info(symbol)
             account_info = self._get_account_info()
-            market_context = await self._get_market_context()
+            market_context = self._get_market_context()
 
-            # Combine into State object
             return State(
-                price_data=price_data,
+                price_data=price_df.to_dict('records')[0] if not price_df.empty else {
+                    'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'volume': 0.0
+                },
                 technical_indicators=technical_data,
                 sentiment_data=sentiment_data,
                 order_book_features=order_book_features,
@@ -655,47 +692,69 @@ class TradingEnvironment:
         except Exception as e:
             self.logger.error(f"Error getting state: {str(e)}")
             raise
-        
-    def _process_bars(self, bars) -> Dict[str, float]:
+            
+    def _process_bars(self, bars) -> pd.DataFrame:
         """Process bar data into required format"""
         try:
-            # Convert bars to DataFrame if not already
-            if not isinstance(bars, pd.DataFrame):
-                bars_df = pd.DataFrame(bars)
-            else:
-                bars_df = bars
+            # Handle empty bars
+            if not bars or not hasattr(bars, '__getitem__'):
+                return pd.DataFrame({
+                    'open': [0.0],
+                    'high': [0.0],
+                    'low': [0.0],
+                    'close': [0.0],
+                    'volume': [0.0]
+                }, index=[pd.Timestamp.now()])  # Add timestamp index
 
-            # Create a single-row DataFrame with the latest values
-            latest_data = pd.DataFrame({
-                'open': [float(bars_df['open'].iloc[-1])],
-                'high': [float(bars_df['high'].iloc[-1])],
-                'low': [float(bars_df['low'].iloc[-1])],
-                'close': [float(bars_df['close'].iloc[-1])],
-                'volume': [float(bars_df['volume'].iloc[-1])]
-            }, index=[0])  # Add an index
-
-            return latest_data
-        except Exception as e:
-            self.logger.error(f"Error processing bars: {str(e)}")
-            # Return a DataFrame with default values if processing fails
+            symbol = self.config['symbol']
+            
+            if symbol in bars:
+                bars_list = []
+                for bar in bars[symbol]:
+                    bars_list.append({
+                        'open': float(bar.open),
+                        'high': float(bar.high),
+                        'low': float(bar.low),
+                        'close': float(bar.close),
+                        'volume': float(bar.volume),
+                        'timestamp': pd.Timestamp(bar.timestamp)
+                    })
+                    
+                if bars_list:
+                    bars_df = pd.DataFrame(bars_list)
+                    if not bars_df.empty:
+                        bars_df.set_index('timestamp', inplace=True)
+                        return bars_df.astype(float)
+            
+            # Return default DataFrame with timestamp index
             return pd.DataFrame({
                 'open': [0.0],
                 'high': [0.0],
                 'low': [0.0],
                 'close': [0.0],
                 'volume': [0.0]
-            }, index=[0])  # Add an index
+            }, index=[pd.Timestamp.now()])
+            
+        except Exception as e:
+            self.logger.error(f"Error processing bars: {str(e)}")
+            return pd.DataFrame({
+                'open': [0.0],
+                'high': [0.0],
+                'low': [0.0],
+                'close': [0.0],
+                'volume': [0.0]
+            }, index=[pd.Timestamp.now()])
         
-    async def _execute_action(self, action: int) -> Dict[str, Any]:
-        """Execute trading action and return execution information"""
+    def _execute_action(self, action: int) -> Dict[str, Any]:
+        """Execute trading action synchronously"""
         try:
             symbol = self.config['symbol']
             position = self._get_position_info(symbol)
             current_position = position['quantity']
             
             # Get current price and account information
-            price_data = await self._fetch_price_data(symbol)
-            current_price = price_data['close'].iloc[-1]
+            price_data = self._fetch_price_data(symbol)
+            current_price = price_data['close'].iloc[-1] if not price_data.empty else 0.0
             account = self._get_account_info()
             
             if action == 0:  # Hold
@@ -757,28 +816,35 @@ class TradingEnvironment:
         try:
             symbol = self.config['symbol']
             
-            # Get current price
-            current_price = float(self.data_manager.get_latest_price(symbol))
-            
-            # Get volatility from technical indicators
-            technical_features = self.technical_analyzer.calculate_features(
+            # Get current price and historical data
+            price_df = self.data_manager.get_market_data(
                 symbol=symbol,
                 start_date=datetime.now() - timedelta(days=30),
                 end_date=datetime.now()
             )
+            
+            if price_df.empty:
+                return 0.0
+                
+            current_price = float(price_df['close'].iloc[-1])
+            
+            # Calculate technical features properly
+            technical_features = self.technical_analyzer.calculate_features(
+                data=price_df,
+                start_date=datetime.now() - timedelta(days=30),
+                end_date=datetime.now()
+            )
+            
+            # Get volatility
             volatility = technical_features.volatility_indicators.get('historical_volatility', 0.02)
             
-            # Get win rate and profit factor from recent trades if available
-            win_rate = None  # Implement logic to calculate win rate if needed
-            profit_factor = None  # Implement logic to calculate profit factor if needed
-            
-            # Use position sizer to calculate size
+            # Use position sizer
             position_size = self.position_sizer.calculate_position_size(
                 price=current_price,
                 volatility=volatility,
                 account_value=equity,
-                win_rate=win_rate,
-                profit_factor=profit_factor
+                win_rate=None,
+                profit_factor=None
             )
             
             return position_size
@@ -796,26 +862,28 @@ class TradingEnvironment:
             
             # Calculate returns if possible
             if len(self.state_history) > 1:
-                prev_price = self.state_history[-2].price_data['close'].iloc[-1]
-                curr_price = state.price_data['close'].iloc[-1]
-                returns = (curr_price - prev_price) / prev_price
-                self.returns_history.append(returns)
+                prev_price = float(self.state_history[-2].price_data.get('close', 0))
+                curr_price = float(state.price_data.get('close', 0))
                 
-                # Update max drawdown
-                if len(self.returns_history) > 1:
-                    cumulative_returns = np.cumsum(self.returns_history)
-                    peak = np.maximum.accumulate(cumulative_returns)
-                    drawdown = (peak - cumulative_returns) / (np.abs(peak) + 1e-6)
-                    self.max_drawdown = max(self.max_drawdown, drawdown[-1])
+                if prev_price > 0 and curr_price > 0:
+                    returns = (curr_price - prev_price) / prev_price
+                    self.returns_history.append(returns)
+                    
+                    # Update max drawdown
+                    if len(self.returns_history) > 1:
+                        cumulative_returns = np.cumsum(self.returns_history)
+                        peak = np.maximum.accumulate(cumulative_returns)
+                        drawdown = (peak - cumulative_returns) / (np.abs(peak) + 1e-6)
+                        self.max_drawdown = max(self.max_drawdown, drawdown[-1])
             
             # Update position history
-            self.position_history.append(state.position_info.get('quantity', 0))
+            pos_qty = state.position_info.get('quantity', 0) if isinstance(state.position_info, dict) else 0
+            self.position_history.append(pos_qty)
             
-            # Update volatility history
-            if 'historical_volatility' in state.technical_indicators:
-                self.volatility_history.append(
-                    state.technical_indicators['historical_volatility']
-                )
+            # Update volatility history safely
+            if isinstance(state.technical_indicators, dict):
+                vol = state.technical_indicators.get('historical_volatility', 0)
+                self.volatility_history.append(vol)
                 
             self.current_step += 1
             

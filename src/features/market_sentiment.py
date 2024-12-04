@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import requests
 import pandas as pd
 from textblob import TextBlob
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
@@ -134,48 +134,45 @@ class MarketSentimentAnalyzer:
         """Update cache with new sentiment data"""
         self.cache[symbol] = (datetime.now(), data)
 
-    async def analyze_sentiment(self, symbol: str) -> MarketSentiment:
-        """
-        Analyze market sentiment from multiple sources
-        """
+    def analyze_sentiment(self, symbol: str) -> Dict:
+        """Analyze market sentiment with synchronous calls"""
         if self._check_cache(symbol):
             return self.cache[symbol][1]
-            
-        try:
-            # Gather sentiment from different sources concurrently
-            news_sentiment = await self._analyze_news_sentiment(symbol)
-            
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                technical_future = executor.submit(self._analyze_technical_sentiment, symbol)
-                fundamental_future = executor.submit(self._analyze_fundamental_sentiment, symbol)
                 
-                technical_sentiment = technical_future.result()
-                fundamental_sentiment = fundamental_future.result()
-            
+        try:
+            # Gather sentiment from different sources
+            news_sentiment = self._analyze_news_sentiment(symbol)
+            technical_sentiment = self._analyze_technical_sentiment(symbol)
+            fundamental_sentiment = self._analyze_fundamental_sentiment(symbol)
+                
             # Calculate composite score with adjusted weights
             composite_score = self._calculate_composite_score(
                 news_sentiment["sentiment_scores"],
                 technical_sentiment,
                 fundamental_sentiment
             )
-            
-            sentiment = MarketSentiment(
-                composite_score=composite_score,
-                news_sentiment=news_sentiment["sentiment_scores"],
-                technical_sentiment=technical_sentiment,
-                fundamental_sentiment=fundamental_sentiment,
-                recent_news=news_sentiment["news_items"]
-            )
-            
+                
+            sentiment = {
+                "composite_score": composite_score,
+                "news_sentiment": news_sentiment["sentiment_scores"],
+                "technical_sentiment": technical_sentiment,
+                "fundamental_sentiment": fundamental_sentiment,
+                "recent_news": news_sentiment["news_items"]
+            }
+                
             self._update_cache(symbol, sentiment)
             return sentiment
-            
+                
         except Exception as e:
             self.logger.error(f"Error analyzing sentiment for {symbol}: {str(e)}")
             raise
 
-    async def _analyze_news_sentiment(self, symbol: str) -> Dict:
-        """Enhanced news sentiment analysis using Alpha Vantage"""
+    def _analyze_news_sentiment(self, symbol: str) -> Dict:
+        """Analyze news sentiment with improved error handling - synchronous version"""
+        if not symbol:
+            self.logger.warning("Symbol cannot be None or empty")
+            return {"sentiment_scores": {}, "news_items": []}
+            
         try:
             time_from = (datetime.now() - timedelta(days=1)).strftime("%Y%m%dT%H%M")
             
@@ -187,31 +184,48 @@ class MarketSentimentAnalyzer:
                 "technology"
             ]
             
-            news_items = await self.alpha_vantage.get_market_news(
-                symbol=symbol,
-                topics=topics,
-                time_from=time_from
-            )
+            # Use requests instead of aiohttp for synchronous calls
+            params = {
+                "function": "NEWS_SENTIMENT",
+                "tickers": symbol,
+                "apikey": self.alpha_vantage.api_key,
+                "sort": "RELEVANCE",
+                "limit": 50,
+                "topics": ",".join(topics),
+                "time_from": time_from
+            }
+            
+            response = requests.get(self.alpha_vantage.base_url, params=params)
+            
+            if response.status_code != 200:
+                self.logger.error(f"Alpha Vantage API error: {response.status_code}")
+                return {"sentiment_scores": {}, "news_items": []}
+                
+            data = response.json()
+            news_items = self.alpha_vantage._parse_news_response(data)
             
             if not news_items:
                 return {
                     "sentiment_scores": {},
                     "news_items": []
                 }
-            
+                
             # Calculate weighted sentiment scores
             source_sentiments = {}
-            for source in set(item.source for item in news_items):
+            for source in set(item.source for item in news_items if item.source):
                 source_items = [item for item in news_items if item.source == source]
                 if source_items:
                     weighted_sentiment = self._calculate_weighted_sentiment(source_items)
+                    confidence = np.mean([item.relevance_score for item in source_items 
+                                    if isinstance(item.relevance_score, (int, float))])
+                    
                     source_sentiments[source] = SentimentScore(
                         value=weighted_sentiment,
-                        confidence=np.mean([item.relevance_score for item in source_items]),
+                        confidence=confidence,
                         source=source,
                         timestamp=datetime.now()
                     )
-            
+                    
             return {
                 "sentiment_scores": source_sentiments,
                 "news_items": news_items
@@ -222,55 +236,123 @@ class MarketSentimentAnalyzer:
             return {"sentiment_scores": {}, "news_items": []}
             
     def _calculate_weighted_sentiment(self, news_items: List[NewsItem]) -> float:
-        """Calculate weighted sentiment score for news items"""
+        """Calculate weighted sentiment score with improved error handling"""
         if not news_items:
             return 0.0
             
-        weights = []
-        sentiments = []
-        
-        for item in news_items:
-            time_weight = self._calculate_time_weight(item.time_published)
-            weight = item.relevance_score * time_weight
+        try:
+            weights = []
+            sentiments = []
             
-            weights.append(weight)
-            sentiments.append(item.sentiment_score)
+            for item in news_items:
+                if not isinstance(item, NewsItem):
+                    continue
+                    
+                # Handle potential missing or invalid values
+                sentiment = item.sentiment_score
+                if not isinstance(sentiment, (int, float)) or np.isnan(sentiment):
+                    continue
+                    
+                relevance = item.relevance_score
+                if not isinstance(relevance, (int, float)) or np.isnan(relevance):
+                    relevance = 1.0
+                    
+                time_weight = self._calculate_time_weight(item.time_published)
+                weight = max(relevance * time_weight, 0.0001)  # Ensure non-zero weight
+                
+                weights.append(weight)
+                sentiments.append(sentiment)
+                
+            if not weights or not sentiments:
+                return 0.0
+                
+            # Use np.average with explicit handling of edge cases
+            weighted_sum = np.sum(np.array(weights) * np.array(sentiments))
+            total_weight = np.sum(weights)
             
-        return np.average(sentiments, weights=weights) if weights else 0.0
+            if total_weight > 0:
+                return float(weighted_sum / total_weight)
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating weighted sentiment: {str(e)}")
+            return 0.0
         
     def _calculate_time_weight(self, published_time: datetime) -> float:
-        """Calculate time-based weight with exponential decay"""
-        age = datetime.now() - published_time
-        hours_old = age.total_seconds() / 3600
-        return np.exp(-hours_old / 24)  # 24-hour half-life
+        """Calculate time-based weight with exponential decay and timezone handling"""
+        try:
+            # Ensure both times are timezone aware
+            now = datetime.now(timezone.utc)
+            if published_time.tzinfo is None:
+                published_time = published_time.replace(tzinfo=timezone.utc)
+                
+            age = now - published_time
+            hours_old = max(age.total_seconds() / 3600, 0)  # Ensure non-negative
+            return np.exp(-hours_old / 24)  # 24-hour half-life
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating time weight: {str(e)}")
+            return 0.0
         
     def _analyze_technical_sentiment(self, symbol: str) -> Dict[str, float]:
-        """Analyze sentiment from technical indicators."""
+        """Analyze sentiment from technical indicators with improved error handling"""
         try:
-            # Define the date range
-            end_date = datetime.now()
+            if not symbol:
+                self.logger.warning("Symbol cannot be None or empty")
+                return {}
+
+            # Define the date range with timezone-aware datetimes
+            end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=90)  # Last 3 months
 
-            # Get market data with more history
-            ticker = yf.Ticker(symbol)
-            data = ticker.history(start=start_date, end=end_date, interval="1d")
+            # Get market data from data manager instead of yfinance
+            data = self.data_manager.get_market_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                period="3mo"
+            )
             
             if data.empty:
                 self.logger.warning(f"No market data available for {symbol}")
                 return {}
             
             # Convert column names to lowercase and ensure float type
-            data = data.astype(float)
             data.columns = data.columns.str.lower()
+            
+            # Handle zero or negative values to prevent division by zero
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+                data[col] = data[col].replace({0: np.nan})
+                data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
+                if data[col].isna().any():
+                    data[col] = data[col].fillna(1.0)  # Last resort default
 
             # Calculate technical features using TechnicalAnalyzer
-            features = self.technical_analyzer.calculate_features(data, start_date=start_date, end_date=end_date)
+            features = self.technical_analyzer.calculate_features(
+                data=data, 
+                start_date=start_date,
+                end_date=end_date
+            )
 
             # Get trading signals
             signals = self.technical_analyzer.get_trading_signals(features)
 
-            # Ensure all values are float
-            return {k: float(v) for k, v in signals.items()}
+            # Ensure all values are float and handle NaN/inf values
+            sanitized_signals = {}
+            for k, v in signals.items():
+                if isinstance(v, (int, float)):
+                    # Replace inf/-inf with max/min valid values
+                    if np.isinf(v):
+                        v = np.sign(v) * 1.0
+                    # Replace NaN with neutral value
+                    if np.isnan(v):
+                        v = 0.0
+                    sanitized_signals[k] = float(v)
+                else:
+                    sanitized_signals[k] = 0.0
+
+            return sanitized_signals
 
         except Exception as e:
             self.logger.error(f"Error in technical sentiment: {str(e)}")
@@ -370,34 +452,62 @@ class MarketSentimentAnalyzer:
             }
             
     def _calculate_composite_score(self, news_sentiment: Dict[str, SentimentScore],
-                                 technical_sentiment: Dict[str, float],
-                                 fundamental_sentiment: Dict[str, float]) -> float:
-        """Calculate weighted composite sentiment score"""
+                                technical_sentiment: Dict[str, float],
+                                fundamental_sentiment: Dict[str, float]) -> float:
+        """Calculate weighted composite sentiment score with improved error handling"""
         try:
-            # Adjusted weights to distribute social sentiment weight
             weights = {
                 'news': 0.4,
                 'technical': 0.3,
                 'fundamental': 0.3
             }
             
-            # Handle empty dictionaries or missing values
-            news_scores = [s.value * s.confidence for s in news_sentiment.values()]
+            # Handle news sentiment safely
+            news_scores = []
+            if news_sentiment:
+                news_scores = [
+                    s.value * s.confidence 
+                    for s in news_sentiment.values() 
+                    if isinstance(s, SentimentScore) and 
+                    isinstance(s.value, (int, float)) and 
+                    isinstance(s.confidence, (int, float)) and 
+                    not np.isnan(s.value) and 
+                    not np.isnan(s.confidence)
+                ]
             news_score = np.mean(news_scores) if news_scores else 0.0
             
-            tech_scores = list(technical_sentiment.values())
+            # Handle technical sentiment
+            tech_scores = []
+            if technical_sentiment:
+                tech_scores = [
+                    v for v in technical_sentiment.values() 
+                    if isinstance(v, (int, float)) and not np.isnan(v)
+                ]
             tech_score = np.mean(tech_scores) if tech_scores else 0.0
             
-            fund_scores = list(fundamental_sentiment.values())
+            # Handle fundamental sentiment
+            fund_scores = []
+            if fundamental_sentiment:
+                fund_scores = [
+                    v for v in fundamental_sentiment.values() 
+                    if isinstance(v, (int, float)) and not np.isnan(v)
+                ]
             fund_score = np.mean(fund_scores) if fund_scores else 0.0
             
+            # Combine scores with weights
             scores = {
                 'news': news_score,
                 'technical': tech_score,
                 'fundamental': fund_score
             }
             
-            composite_score = sum(scores[k] * weights[k] for k in weights.keys())
+            # Calculate weighted sum with validation
+            composite_score = sum(
+                scores[k] * weights[k] 
+                for k in weights.keys() 
+                if isinstance(scores[k], (int, float)) and not np.isnan(scores[k])
+            )
+            
             return float(np.clip(composite_score, -1, 1))
             
         except Exception as e:
@@ -405,6 +515,6 @@ class MarketSentimentAnalyzer:
             return 0.0
 
     # Add an alias method for compatibility
-    async def get_sentiment(self, symbol: str) -> MarketSentiment:
-        """Alias for analyze_sentiment for backward compatibility"""
-        return await self.analyze_sentiment(symbol)
+    def get_sentiment(self, symbol: str) -> Dict:
+        """Synchronous alias for analyze_sentiment"""
+        return self.analyze_sentiment(symbol)

@@ -5,7 +5,7 @@ from typing import Dict, List, Union, Tuple
 from dataclasses import dataclass
 import talib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from src.data.data_manager import DataManager
 
 @dataclass
@@ -30,15 +30,45 @@ class TechnicalAnalyzer:
         }
 
     def calculate_features(self, data: pd.DataFrame, start_date: datetime, end_date: datetime) -> TechnicalFeatures:
-        """Calculate technical features based on historical data."""
+        """Calculate technical features with improved datetime handling"""
         try:
-            if not self._validate_market_data(data):
-                self.logger.warning(f"No valid data for the specified date range: {start_date} to {end_date}")
+            # Make a copy to avoid modifying original data
+            df = data.copy()
+            
+            # Ensure start_date and end_date are timezone aware
+            if start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=timezone.utc)
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+                
+            # Convert index to UTC timezone if needed
+            if df.index.tzinfo is None:
+                df.index = df.index.tz_localize('UTC')
+                
+            # Ensure data is within date range using timezone aware comparison
+            mask = (df.index >= start_date) & (df.index <= end_date)
+            df = df.loc[mask]
+            
+            if not self._validate_market_data(df):
+                self.logger.warning(f"Invalid data for period {start_date} to {end_date}")
                 return self._get_default_features()
-
+                
+            # Convert data types and handle NaN values
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+            df = df.ffill().bfill()
+            
+            # Check for zero values in critical columns
+            if (df['close'] == 0).any() or (df['volume'] == 0).any():
+                self.logger.warning("Found zero values in close price or volume")
+                df.replace(0, np.nan, inplace=True)
+                df = df.ffill().bfill()
+            
             # Proceed with calculations
-            return self._calculate_features_from_data(data)
-
+            return self._calculate_features_from_data(df)
+            
         except Exception as e:
             self.logger.error(f"Error calculating features: {str(e)}")
             return self._get_default_features()
@@ -171,19 +201,44 @@ class TechnicalAnalyzer:
             return self._get_default_features().momentum_indicators
 
     def _validate_market_data(self, data: pd.DataFrame) -> bool:
+        """Validate market data with improved error handling"""
         required_columns = ['open', 'high', 'low', 'close', 'volume']
         
-        if data is None or data.empty:
-            self.logger.warning("No data available")
+        if data is None:
+            self.logger.warning("Data is None")
             return False
             
-        if len(data) < 2:
-            self.logger.warning("Insufficient data points")
+        if not isinstance(data, pd.DataFrame):
+            self.logger.warning(f"Invalid data type: {type(data)}")
             return False
             
+        if data.empty:
+            self.logger.warning("Empty DataFrame")
+            return False
+            
+        # Convert index to datetime if not already
+        if not isinstance(data.index, pd.DatetimeIndex):
+            try:
+                data.index = pd.to_datetime(data.index)
+            except Exception as e:
+                self.logger.warning(f"Could not convert index to datetime: {e}")
+                return False
+                
+        # Check for required columns
         missing_cols = [col for col in required_columns if col not in data.columns]
         if missing_cols:
             self.logger.warning(f"Missing columns: {missing_cols}")
+            return False
+            
+        # Check for minimum data points
+        if len(data) < self.lookback_periods['long']:
+            self.logger.warning(f"Insufficient data points. Need at least {self.lookback_periods['long']}")
+            return False
+            
+        # Check for null values
+        null_counts = data[required_columns].isnull().sum()
+        if null_counts.any():
+            self.logger.warning(f"Found null values: {null_counts[null_counts > 0]}")
             return False
             
         return True

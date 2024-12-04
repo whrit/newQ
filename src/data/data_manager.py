@@ -2,7 +2,7 @@
 import sqlite3
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import yfinance as yf
 from alpaca.trading.client import TradingClient
@@ -80,27 +80,60 @@ class DataManager:
             self.logger.error(f"Error initializing database: {str(e)}")
             raise
 
-    def get_market_data(self, symbol: str, start_date: Optional[datetime], end_date: Optional[datetime], period: str = "6mo") -> pd.DataFrame:
-        """Get market data from database or APIs."""
+    def get_market_data(self, symbol: str, start_date: Optional[datetime], 
+                    end_date: Optional[datetime], period: str = "6mo") -> pd.DataFrame:
+        """Get market data with improved timezone and error handling"""
         try:
-            # If no new data is needed, use the cache
+            if not symbol:
+                self.logger.warning("Symbol cannot be None or empty")
+                return pd.DataFrame()
+                
+            # Convert dates to UTC timezone aware datetime if needed
+            if isinstance(start_date, pd.Timestamp):
+                start_date = start_date.tz_localize('UTC')
+            elif isinstance(start_date, datetime) and start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=timezone.utc)
+                
+            if isinstance(end_date, pd.Timestamp):
+                end_date = end_date.tz_localize('UTC')
+            elif isinstance(end_date, datetime) and end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+                
+            # If no end date specified, use current time
+            if end_date is None:
+                end_date = datetime.now(timezone.utc)
+                
+            # If no start date specified, use period
+            if start_date is None:
+                if period.endswith('mo'):
+                    months = int(period[:-2])
+                    start_date = end_date - timedelta(days=months * 30)
+                elif period.endswith('d'):
+                    days = int(period[:-1])
+                    start_date = end_date - timedelta(days=days)
+                    
+            # Check cached data first
             if not self._needs_update(symbol):
-                data = self._get_cached_data(symbol, start_date, end_date)
-                if not data.empty:
-                    return data
-            
-            # Fetch new data from APIs
+                cached_data = self._get_cached_data(symbol, start_date, end_date)
+                if not cached_data.empty:
+                    return cached_data
+                    
+            # Fetch new data
             data = self._fetch_alpaca_data(symbol, start_date, end_date)
             if data.empty:
                 data = self._fetch_yfinance_data(symbol, period)
-            
+                
+            # Ensure timezone aware datetime index
+            if not data.empty and data.index.tzinfo is None:
+                data.index = data.index.tz_localize('UTC')
+                
             # Save and cache new data
             if not data.empty:
                 self._save_market_data(symbol, data)
-                self._last_update[symbol] = datetime.now()
-            
+                self._last_update[symbol] = datetime.now(timezone.utc)
+                
             return data
-
+            
         except Exception as e:
             self.logger.error(f"Error fetching market data for {symbol}: {str(e)}")
             return pd.DataFrame()
@@ -111,21 +144,27 @@ class DataManager:
             return True
         return datetime.now() - self._last_update[symbol] > self.cache_duration
 
-    def _get_cached_data(self, 
-                        symbol: str, 
+    def _get_cached_data(self, symbol: str, 
                         start_date: Optional[datetime],
                         end_date: Optional[datetime]) -> pd.DataFrame:
-        """Get data from SQLite database"""
+        """Get cached data with improved timezone handling"""
         try:
             query = "SELECT * FROM market_data WHERE symbol = ?"
             params = [symbol]
             
             if start_date:
+                # Convert to UTC if has timezone, otherwise use naive datetime
+                if start_date.tzinfo:
+                    start_date = start_date.astimezone(timezone.utc)
                 query += " AND Date >= ?"
-                params.append(start_date)
+                params.append(start_date.strftime('%Y-%m-%d %H:%M:%S'))
+                
             if end_date:
+                # Convert to UTC if has timezone, otherwise use naive datetime
+                if end_date.tzinfo:
+                    end_date = end_date.astimezone(timezone.utc)
                 query += " AND Date <= ?"
-                params.append(end_date)
+                params.append(end_date.strftime('%Y-%m-%d %H:%M:%S'))
                 
             query += " ORDER BY Date"
             
@@ -134,8 +173,10 @@ class DataManager:
             conn.close()
             
             if not df.empty:
-                df.set_index('timestamp', inplace=True)
-            
+                # Convert to UTC timezone aware datetime
+                df['Date'] = pd.to_datetime(df['Date'], utc=True)
+                df.set_index('Date', inplace=True)
+                
             return df
             
         except Exception as e:
@@ -351,3 +392,17 @@ class DataManager:
         except Exception as e:
             self.logger.error(f"Error getting latest price: {str(e)}")
             return 0.0
+        
+    def get_sector(self, symbol: str) -> str:
+        """Get sector for a given symbol with improved error handling"""
+        try:
+            if not symbol:
+                self.logger.warning("Symbol cannot be None or empty")
+                return 'Unknown'
+                
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            return info.get('sector', 'Unknown')
+        except Exception as e:
+            self.logger.error(f"Error getting sector for {symbol}: {str(e)}")
+            return 'Unknown'

@@ -17,6 +17,23 @@ class SectorMetrics:
     risk_metrics: Dict[str, float]
     sector_rotation: Dict[str, float]
 
+    def to_dict(self) -> Dict[str, float]:
+        """Convert metrics to flat dictionary"""
+        metrics = {
+            'correlation': self.correlation,
+            'relative_strength': self.relative_strength,
+        }
+        # Add flattened performance metrics
+        for k, v in self.performance_metrics.items():
+            metrics[f'performance_{k}'] = v
+        # Add flattened risk metrics    
+        for k, v in self.risk_metrics.items():
+            metrics[f'risk_{k}'] = v
+        # Add flattened rotation metrics
+        for k, v in self.sector_rotation.items():
+            metrics[f'rotation_{k}'] = v
+        return metrics
+
 class SectorAnalyzer:
     """
     Advanced sector analysis for market context
@@ -63,31 +80,58 @@ class SectorAnalyzer:
             
     def _calculate_correlation(self, symbol: str, sector_data: pd.DataFrame) -> float:
         """Calculate correlation with sector"""
-        symbol_returns = sector_data[symbol].pct_change().dropna()
-        sector_returns = sector_data.mean(axis=1).pct_change().dropna()
-        return symbol_returns.corr(sector_returns)
-        
-# Continuation of src/features/sector_analysis.py
+        try:
+            # Ensure case consistency
+            if symbol not in sector_data.columns:
+                return 0.0
 
-    def _calculate_relative_strength(self, sector_data: pd.DataFrame,
-                                   market_data: pd.DataFrame) -> float:
-        """
-        Calculate sector's relative strength against market
-        """
-        # Calculate returns
-        sector_returns = sector_data.mean(axis=1).pct_change().dropna()
-        market_returns = market_data['close'].pct_change().dropna()
-        
-        # Calculate relative strength over different periods
-        rs_scores = {}
-        for period_name, period in self.lookback_periods.items():
-            sector_perf = (1 + sector_returns.tail(period)).prod() - 1
-            market_perf = (1 + market_returns.tail(period)).prod() - 1
-            rs_scores[period_name] = sector_perf / market_perf if market_perf != 0 else 0
+            # Calculate returns with error handling
+            symbol_returns = sector_data[symbol].pct_change().fillna(0)
+            sector_mean = sector_data.mean(axis=1)
+            sector_returns = sector_mean.pct_change().fillna(0)
             
-        # Weighted average of different timeframes
-        weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
-        return sum(rs_scores[period] * weights[period] for period in weights)
+            if len(symbol_returns) < 2:
+                return 0.0
+                
+            return float(symbol_returns.corr(sector_returns))
+        except Exception as e:
+            self.logger.error(f"Error calculating correlation: {str(e)}")
+            return 0.0
+        
+    def _calculate_relative_strength(self, sector_data: pd.DataFrame,
+                                market_data: pd.DataFrame) -> float:
+        """Calculate sector's relative strength against market"""
+        try:
+            # Ensure market_data has 'close' column
+            market_close = None
+            if 'Close' in market_data.columns:
+                market_close = market_data['Close']
+            elif 'close' in market_data.columns:
+                market_close = market_data['close']
+            else:
+                return 0.0
+                    
+            # Calculate returns
+            sector_returns = sector_data.mean(axis=1).pct_change().fillna(0)
+            market_returns = market_close.pct_change().fillna(0)
+            
+            # Calculate relative strength over different periods
+            rs_scores = {}
+            for period_name, period in self.lookback_periods.items():
+                if len(sector_returns) >= period and len(market_returns) >= period:
+                    sector_perf = (1 + sector_returns.tail(period)).prod() - 1
+                    market_perf = (1 + market_returns.tail(period)).prod() - 1
+                    rs_scores[period_name] = sector_perf / market_perf if abs(market_perf) > 1e-6 else 0
+                else:
+                    rs_scores[period_name] = 0
+                        
+            # Weighted average of different timeframes
+            weights = {'short': 0.5, 'medium': 0.3, 'long': 0.2}
+            return sum(rs_scores[period] * weights[period] for period in weights)
+                
+        except Exception as e:
+            self.logger.error(f"Error calculating relative strength: {str(e)}")
+            return 0.0
         
     def _calculate_performance_metrics(self, sector_data: pd.DataFrame) -> Dict[str, float]:
         """
